@@ -1,11 +1,9 @@
-const DEBUG_MODE = true; 
+const DEBUG_MODE = false; 
 
 let aiSession = null;
 const scanCache = new Map(); 
 const userCache = new Map(); 
 const currentlyProcessingHashes = new Set(); 
-const postHostMap = new WeakMap();
-const waitingElements = new WeakSet();
 
 let aiLock = Promise.resolve();
 let taskIdCounter = 0;    
@@ -42,6 +40,7 @@ async function checkContent(text, postElement) {
       queuedTasks--;
       
       if (!document.body.contains(postElement)) {
+        logDebug(`🗑️ [丟棄] 任務 #${taskId} 貼文已滑走。剩餘排隊: ${queuedTasks}`);
         resolve(null); 
         return;
       }
@@ -90,11 +89,27 @@ async function checkContent(text, postElement) {
   });
 }
 
-function addWarningLabel(postElement, state, textHash = "無指紋") {
-  let host = postHostMap.get(postElement);
+// --- 3. 注入 UI (自動清理與復用宿主 + 觀測 Log) ---
+function addWarningLabel(postElement, state) {
+  const hashForLog = (postElement.getAttribute('data-guard-hash') || '未知').substring(0, 6);
+  
+  // 只尋找「直屬於」這個貼文框框的宿主 (排除引用貼文)
+  const existingHosts = Array.from(postElement.querySelectorAll('.scam-warning-host'))
+                             .filter(el => el.parentNode === postElement);
 
-  if (host && host.getAttribute('data-state') === state && state === 'safe') {
-    return;
+  let host = existingHosts.length > 0 ? existingHosts[0] : null;
+
+  // 清除 React 偷偷複製產生的殘留多餘宿主
+  if (existingHosts.length > 1) {
+    logDebug(`🧹 [UI 清理] 框框 [${hashForLog}] 發現 ${existingHosts.length - 1} 個多餘幽靈標籤，執行刪除！`);
+    for (let i = 1; i < existingHosts.length; i++) {
+      existingHosts[i].remove();
+    }
+  }
+
+  // 狀態沒變就跳過
+  if (host && host.getAttribute('data-state') === state) {
+    return; 
   }
 
   postElement.style.position = 'relative';
@@ -103,6 +118,7 @@ function addWarningLabel(postElement, state, textHash = "無指紋") {
   let label;
 
   if (!host) {
+    logDebug(`✨ [UI 建立] 為框框 [${hashForLog}] 建立全新標籤，狀態: ${state}`);
     host = document.createElement('div');
     host.className = 'scam-warning-host';
     host.style.cssText = [
@@ -128,8 +144,8 @@ function addWarningLabel(postElement, state, textHash = "無指紋") {
 
     shadow.appendChild(label);
     postElement.appendChild(host);
-    postHostMap.set(postElement, host);
   } else {
+    logDebug(`🔄 [UI 更新] 框框 [${hashForLog}] 找到既有標籤，更新狀態為: ${state}`);
     label = host.shadowRoot.firstChild;
   }
 
@@ -146,23 +162,31 @@ function addWarningLabel(postElement, state, textHash = "無指紋") {
   label.style.backgroundColor = config[1];
 }
 
+// --- 4. 處理單一貼文 ---
 async function processPost(post) {
-  if (postHostMap.has(post)) return;
-  if (waitingElements.has(post)) return;
-  if (post._guardSkip) return;
+  // 取出乾淨純文字 (避開自己和巢狀)
+  const cloneNode = post.cloneNode(true);
+  cloneNode.querySelectorAll('.scam-warning-host').forEach(np => np.remove());
+  cloneNode.querySelectorAll('div[data-pressable-container="true"]').forEach(np => np.remove());
 
-  // 🔍 LOG：第幾次呼叫 + 當下狀態
-  post._guardCallCount = (post._guardCallCount || 0) + 1;
-  if (post._guardCallCount > 1) {
-    console.warn(
-      `[Guard] ⚠️ 第 ${post._guardCallCount} 次 | ` +
-      `WeakMap=${postHostMap.has(post)} | ` +
-      `WeakSet=${waitingElements.has(post)} | ` +
-      `hash=${post.getAttribute('data-guard-hash') ?? '無'} | ` +
-      `text="${post.innerText.trim().substring(0, 20).replace(/\n/g, ' ')}"`
-    );
-    console.trace('[Guard] call stack');
+  const cleanText = cloneNode.innerText.trim();
+  if (!cleanText || cleanText.length < 5) return; 
+
+  const textHash = cleanText.substring(0, 30).replace(/\s/g, '');
+  const oldHash = post.getAttribute('data-guard-hash');
+
+  // 指紋驗證！如果這個框框目前的指紋跟文字一樣，代表沒變，安全跳過！
+  if (oldHash === textHash) {
+    return; 
   }
+
+  // 如果框框有舊指紋，但跟現在的文字不合，代表被 React 拿去回收利用了！
+  if (oldHash && oldHash !== textHash) {
+    logDebug(`♻️ [DOM 回收偵測] 抓到 React 替換框框！舊: ${oldHash.substring(0,6)} -> 新: ${textHash.substring(0,6)}`);
+  }
+
+  // 立刻幫它蓋上新的指紋刺青
+  post.setAttribute('data-guard-hash', textHash);
 
   const isVerifiedAccount = post.querySelector('svg[aria-label="已驗證"], svg[aria-label="Verified"]');
   if (isVerifiedAccount) {
@@ -173,37 +197,59 @@ async function processPost(post) {
   const userLink = post.querySelector('a[href^="/@"]');
   const username = userLink ? userLink.getAttribute('href') : null;
 
+  // ==========================================
+  // 【終極防線】系統訊息與官方卡片攔截網 (含除錯 Log)
+  // ==========================================
+  const SYSTEM_KEYWORDS = [
+    '你的回覆獲得', 
+    '你的串文獲得', 
+    '為你推薦', 
+    '為您推薦',
+    '推薦追蹤'
+  ];
+
+  let matchedKeyword = null;
+  const hasSystemKeyword = SYSTEM_KEYWORDS.some(keyword => {
+    if (cleanText.includes(keyword)) {
+      matchedKeyword = keyword;
+      return true;
+    }
+    return false;
+  });
+
+  const isSystemMessage = !username || hasSystemKeyword;
+
+  if (isSystemMessage) {
+    const reason = !username ? '無帳號連結' : `觸發關鍵字 [${matchedKeyword}]`;
+    logDebug(`🚫 [系統過濾] 攔截原因: ${reason} | 內文: ${cleanText.substring(0, 15).replace(/\n/g, ' ')}...`);
+    
+    // 如果這個框框是 React 回收再利用的，把前一篇貼文殘留的標籤撕掉！
+    const oldLabels = post.querySelectorAll('.scam-warning-host');
+    if (oldLabels.length > 0) {
+      logDebug(`   🧹 [系統過濾清理] 撕除 ${oldLabels.length} 個殘留的幽靈標籤！`);
+      oldLabels.forEach(el => el.remove());
+    }
+    
+    return; // 直接略過，不上標籤，也不送 AI
+  }
+  // ==========================================
+
   if (username && userCache.has(username)) {
     addWarningLabel(post, userCache.get(username) ? 'scam' : 'safe');
     return;
   }
 
-  const cloneNode = post.cloneNode(true);
-  const nestedPosts = cloneNode.querySelectorAll('div[data-pressable-container="true"]');
-  nestedPosts.forEach(np => np.remove());
-
-  const cleanText = cloneNode.innerText.trim();
-  if (!cleanText || cleanText.length < 5) {
-    post._guardSkip = true;
-    return;
-  }
-
-  const textHash = cleanText.substring(0, 30).replace(/\s/g, '');
-
   if (scanCache.has(textHash)) {
-    addWarningLabel(post, scanCache.get(textHash) ? 'scam' : 'safe', textHash);
+    addWarningLabel(post, scanCache.get(textHash) ? 'scam' : 'safe');
     return;
   }
 
   if (currentlyProcessingHashes.has(textHash)) {
-    post.setAttribute('data-guard-hash', textHash);
-    waitingElements.add(post);
+    addWarningLabel(post, 'scanning');
     return;
   }
 
-  waitingElements.add(post);
-  post.setAttribute('data-guard-hash', textHash);
-  addWarningLabel(post, 'scanning', textHash);
+  addWarningLabel(post, 'scanning');
   currentlyProcessingHashes.add(textHash);
 
   const isScam = await checkContent(cleanText, post);
@@ -213,14 +259,15 @@ async function processPost(post) {
     if (username) userCache.set(username, isScam);
     currentlyProcessingHashes.delete(textHash);
 
-    document
-      .querySelectorAll(`div[data-pressable-container="true"][data-guard-hash="${textHash}"]`)
-      .forEach(el => addWarningLabel(el, isScam ? 'scam' : 'safe', textHash));
+    // AI 算完後，尋找畫面上「目前依然保有這個指紋」的框框來更新
+    document.querySelectorAll(`div[data-pressable-container="true"][data-guard-hash="${textHash}"]`)
+            .forEach(el => addWarningLabel(el, isScam ? 'scam' : 'safe'));
   } else {
     currentlyProcessingHashes.delete(textHash);
   }
 }
 
+// --- 5 & 6. 掃描與防抖監聽 ---
 function scanPosts() {
   const posts = document.querySelectorAll('div[data-pressable-container="true"]');
   posts.forEach(post => processPost(post));
@@ -229,9 +276,7 @@ function scanPosts() {
 let scanTimeout = null;
 function debouncedScan() {
   if (scanTimeout) clearTimeout(scanTimeout);
-  scanTimeout = setTimeout(() => {
-    scanPosts();
-  }, 300); 
+  scanTimeout = setTimeout(() => scanPosts(), 300); 
 }
 
 initGuardSystem().then(() => {
