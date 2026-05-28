@@ -29,7 +29,9 @@ async function initGuardSystem() {
   }
 }
 
-async function checkContent(text, postElement) {
+// --- 2. 核心 AI 判讀 (加入二次快取確認機制) ---
+// 【修改】多傳入 username 和 textHash 讓隊列內部可以檢查
+async function checkContent(text, postElement, username, textHash) {
   if (!text) return false;
 
   const taskId = ++taskIdCounter;
@@ -40,10 +42,23 @@ async function checkContent(text, postElement) {
       queuedTasks--;
       
       if (!document.body.contains(postElement)) {
-        logDebug(`🗑️ [丟棄] 任務 #${taskId} 貼文已滑走。剩餘排隊: ${queuedTasks}`);
         resolve(null); 
         return;
       }
+
+      // ==========================================
+      // 【終極防線：二次快取確認】
+      // 因為在排隊的這幾秒鐘內，前面的任務可能已經把這個帳號判斷完了！
+      if (username && userCache.has(username)) {
+        logDebug(`⚡ [快取攔截] 帳號 ${username} 已被前置任務判讀，瞬間套用結果！`);
+        resolve(userCache.get(username));
+        return;
+      }
+      if (textHash && scanCache.has(textHash)) {
+        resolve(scanCache.get(textHash));
+        return;
+      }
+      // ==========================================
 
       timeDebug(`⏱️ 任務 #${taskId} 耗時`);
 
@@ -75,8 +90,13 @@ async function checkContent(text, postElement) {
           
           const response = await aiSession.prompt(strictPrompt);
           const resultText = response.trim().toLowerCase();
-          
-          resolve(resultText.includes('true'));
+          const isScam = resultText.includes('true');
+
+          // 【提早寫入快取】AI 算完的瞬間立刻寫入，讓排在後面的兄弟不用再算！
+          if (username) userCache.set(username, isScam);
+          if (textHash) scanCache.set(textHash, isScam);
+
+          resolve(isScam);
         } catch (error) {
           resolve(false); 
         } finally {
@@ -164,7 +184,6 @@ function addWarningLabel(postElement, state) {
 
 // --- 4. 處理單一貼文 ---
 async function processPost(post) {
-  // 取出乾淨純文字 (避開自己和巢狀)
   const cloneNode = post.cloneNode(true);
   cloneNode.querySelectorAll('.scam-warning-host').forEach(np => np.remove());
   cloneNode.querySelectorAll('div[data-pressable-container="true"]').forEach(np => np.remove());
@@ -175,17 +194,14 @@ async function processPost(post) {
   const textHash = cleanText.substring(0, 30).replace(/\s/g, '');
   const oldHash = post.getAttribute('data-guard-hash');
 
-  // 指紋驗證！如果這個框框目前的指紋跟文字一樣，代表沒變，安全跳過！
   if (oldHash === textHash) {
     return; 
   }
 
-  // 如果框框有舊指紋，但跟現在的文字不合，代表被 React 拿去回收利用了！
   if (oldHash && oldHash !== textHash) {
     logDebug(`♻️ [DOM 回收偵測] 抓到 React 替換框框！舊: ${oldHash.substring(0,6)} -> 新: ${textHash.substring(0,6)}`);
   }
 
-  // 立刻幫它蓋上新的指紋刺青
   post.setAttribute('data-guard-hash', textHash);
 
   const isVerifiedAccount = post.querySelector('svg[aria-label="已驗證"], svg[aria-label="Verified"]');
@@ -197,9 +213,11 @@ async function processPost(post) {
   const userLink = post.querySelector('a[href^="/@"]');
   const username = userLink ? userLink.getAttribute('href') : null;
 
-  // ==========================================
-  // 【終極防線】系統訊息與官方卡片攔截網 (含除錯 Log)
-  // ==========================================
+  // 【新增】幫這個貼文框框掛上「帳號名牌」，方便後續全域廣播連動！
+  if (username) {
+    post.setAttribute('data-guard-user', username);
+  }
+
   const SYSTEM_KEYWORDS = [
     '你的回覆獲得', 
     '你的串文獲得', 
@@ -223,16 +241,12 @@ async function processPost(post) {
     const reason = !username ? '無帳號連結' : `觸發關鍵字 [${matchedKeyword}]`;
     logDebug(`🚫 [系統過濾] 攔截原因: ${reason} | 內文: ${cleanText.substring(0, 15).replace(/\n/g, ' ')}...`);
     
-    // 如果這個框框是 React 回收再利用的，把前一篇貼文殘留的標籤撕掉！
     const oldLabels = post.querySelectorAll('.scam-warning-host');
     if (oldLabels.length > 0) {
-      logDebug(`   🧹 [系統過濾清理] 撕除 ${oldLabels.length} 個殘留的幽靈標籤！`);
       oldLabels.forEach(el => el.remove());
     }
-    
-    return; // 直接略過，不上標籤，也不送 AI
+    return; 
   }
-  // ==========================================
 
   if (username && userCache.has(username)) {
     addWarningLabel(post, userCache.get(username) ? 'scam' : 'safe');
@@ -252,16 +266,24 @@ async function processPost(post) {
   addWarningLabel(post, 'scanning');
   currentlyProcessingHashes.add(textHash);
 
-  const isScam = await checkContent(cleanText, post);
+  const isScam = await checkContent(cleanText, post, username, textHash);
 
   if (isScam !== null) {
     scanCache.set(textHash, isScam);
     if (username) userCache.set(username, isScam);
     currentlyProcessingHashes.delete(textHash);
 
-    // AI 算完後，尋找畫面上「目前依然保有這個指紋」的框框來更新
+    const finalState = isScam ? 'scam' : 'safe';
+
+    // 1. 更新所有「相同文字指紋」的貼文 (例如被引用的相同文章)
     document.querySelectorAll(`div[data-pressable-container="true"][data-guard-hash="${textHash}"]`)
-            .forEach(el => addWarningLabel(el, isScam ? 'scam' : 'safe'));
+            .forEach(el => addWarningLabel(el, finalState));
+            
+    // 【關鍵更新】2. 更新畫面上所有「同一個帳號」的貼文！打破排隊視覺延遲！
+    if (username) {
+      document.querySelectorAll(`div[data-pressable-container="true"][data-guard-user="${username}"]`)
+              .forEach(el => addWarningLabel(el, finalState));
+    }
   } else {
     currentlyProcessingHashes.delete(textHash);
   }
