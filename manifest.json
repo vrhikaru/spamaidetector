@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Threads 防詐騙與 AI 警示",
+  "version": "1.0",
+  "description": "在 Threads 上標記可能的 AI 帳戶或詐騙貼文。",
+  "permissions": [
+    "activeTab",
+    "languageModel"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "開啟 Threads 警示設定"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.threads.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}

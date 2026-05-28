@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>Threads 警示設定</title>
+  <style>
+    body {
+      width: 320px;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      padding: 15px;
+      margin: 0;
+      color: #333;
+    }
+    h2 { font-size: 16px; margin-top: 0; border-bottom: 1px solid #ccc; padding-bottom: 8px; }
+    .status-box { padding: 10px; border-radius: 6px; margin-bottom: 15px; font-weight: bold; text-align: center; }
+    .status-ok { background-color: #d4edda; color: #155724; }
+    .status-error { background-color: #f8d7da; color: #721c24; }
+    .instructions { font-size: 13px; line-height: 1.5; display: none; }
+    
+    /* 下載區塊專用樣式 */
+    #downloadSection { display: none; text-align: center; margin-top: 10px; }
+    #downloadBtn {
+      background-color: #007bff; color: white; border: none; padding: 10px 15px;
+      border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%;
+    }
+    #downloadBtn:disabled { background-color: #cccccc; cursor: not-allowed; }
+    #downloadProgress { font-size: 12px; margin-top: 8px; color: #666; font-family: monospace; }
+  </style>
+</head>
+<body>
+
+  <h2>🛡️ Threads AI 防護</h2>
+  
+  <div id="aiStatus" class="status-box">正在檢查 AI 狀態...</div>
+
+  <div id="downloadSection">
+    <p style="font-size: 13px; margin-top: 0;">Chrome 需要下載核心 AI 模型才能啟用防護。</p>
+    <button id="downloadBtn">📥 開始下載 AI 模型</button>
+    <div id="downloadProgress"></div>
+  </div>
+
+  <div id="setupInstructions" class="instructions">
+    </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
