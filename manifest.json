@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Threads 防詐騙與 AI 警示",
-  "version": "1.0",
+  "version": "1.0.1",
   "description": "在 Threads 上標記可能的 AI 帳戶或詐騙貼文。",
   "permissions": [
     "activeTab",
